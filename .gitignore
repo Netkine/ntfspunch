@@ -1,0 +1,9 @@
+.*.swp
+.*.cmd
+.tmp_versions
+Module.symvers
+*.o
+modules.order
+*.ko
+ntfspunch.mod.c
+ntfspunch.mod.h
