@@ -197,6 +197,31 @@ static struct block_device_operations ntfspunch_ops = {
 };
 
 /*
+ * Free an already locked device
+ */
+static void
+ntfspunch_free_dev(struct mapping_dev *dev)
+{
+	if (dev->users > 0) {
+		printk(KERN_DEBUG "ntfspunch: %s still in use %d\n",
+		       dev->filename, dev->users);
+		/* TODO - block freeing if it's inuse */
+	}
+	if (dev->img_fp) {
+		filp_close(dev->img_fp, 0);
+	}
+	if (dev->gd) {
+		del_gendisk(dev->gd);
+		put_disk(dev->gd);
+	}
+	if (dev->queue) {
+		blk_cleanup_queue(dev->queue);
+	}
+	kfree(dev->rl);
+	kfree(dev);
+}
+
+/*
  * Perform as much validation as possible on the requetsed file
  */
 int
@@ -319,6 +344,7 @@ add_device(char *in_filename)
 		if (dev_list == NULL) {
 			printk(KERN_WARNING "ntfspunch: unable to allocate device %s\n",
 			       filename);
+			filp_close(img_fp, 0);
 			spin_unlock(&dev_list_lock);
 			return -ENOMEM;
 		}
@@ -329,6 +355,7 @@ add_device(char *in_filename)
 			printk(KERN_WARNING "ntfspunch: unable to allocate device %s\n",
 			       filename);
 			spin_unlock(&dev_list_lock);
+			filp_close(img_fp, 0);
 			return -ENOMEM;
 		}
 		printk(KERN_WARNING "ntfspunch: realloc of dev_list - old:%p new %p\n",
@@ -338,16 +365,26 @@ add_device(char *in_filename)
 	}
 	device_num = num_devices;
 	dev = dev_list[device_num] = kmalloc(sizeof(*dev), GFP_KERNEL);
-	num_devices++;
-	spin_unlock(&dev_list_lock);
+	if (dev == NULL) {
+		printk(KERN_WARNING "ntfspunch: unable to allocate queue\n");
+		spin_unlock(&dev_list_lock);
+		return -ENOMEM;
+	}
 
 	spin_lock_init(&dev->lock);
 	spin_lock(&dev->lock);
 	dev->img_fp = img_fp;
 	dev->users = 0;
+	dev->gd = NULL;
+	dev->queue = NULL;
+	dev->rl = NULL;
 	strncpy(dev->filename, filename, PATH_MAX);
 	dev->ni = NTFS_I(img_fp->f_inode);
 	dev->rl = copy_runlist(&dev->ni->runlist);
+	if (dev->rl == NULL) {
+		printk(KERN_WARNING "ntfspunch: unable to copy runlist\n");
+		goto devfree;
+	}
 	dev->cluster_size = dev->ni->vol->cluster_size;
 	dev->size = dev->ni->allocated_size;
 
@@ -355,20 +392,19 @@ add_device(char *in_filename)
 	dev->queue = blk_alloc_queue(GFP_KERNEL);
 	if (dev->queue == NULL) {
 		printk(KERN_WARNING "ntfspunch: unable to allocate queue\n");
-		return -ENOMEM;
+		goto devfree;
 	}
 	blk_queue_make_request(dev->queue, ntfspunch_make_request);
 	blk_limits_max_hw_sectors(&dev->queue->limits, dev->cluster_size >> 9);
-	//blk_queue_logical_block_size(dev->queue, dev->cluster_size);
 	dev->queue->queuedata = dev;
 
 	/* Gendisk setup */
 	dev->gd = alloc_disk(1);
-	if (! dev->gd) {
+	if (dev->gd == NULL) {
 		printk(KERN_WARNING "ntfspunch: unable to allocate device\n");
-		kfree(dev->queue);
-		return -ENOMEM;
+		goto devfree;
 	}
+
 	dev->gd->major = ntfspunch_major;
 	dev->gd->first_minor = device_num;
 	dev->gd->fops = &ntfspunch_ops;
@@ -383,14 +419,25 @@ add_device(char *in_filename)
 
 	blk_queue_flush(dev->queue, REQ_FLUSH | REQ_FUA);
 
-	proc_add_node(device_num);
-	add_disk(dev->gd);
-	printk(KERN_DEBUG "ntfspunch: Added file %s\n", dev->filename);
+	num_devices++;
+	spin_unlock(&dev_list_lock);
 	spin_unlock(&dev->lock);
+
+	add_disk(dev->gd);
+	proc_add_node(device_num);
+
+
+	printk(KERN_DEBUG "ntfspunch: Added file %s\n", dev->filename);
 #if NP_DEBUG_SETUP
 	dump_unlocked_device(device_num);
 #endif
 	return 0;
+
+devfree:
+	ntfspunch_free_dev(dev);
+	spin_unlock(&dev_list_lock);
+	return -ENOMEM;
+
 }
 
 static int __init
@@ -428,22 +475,7 @@ ntfspunch_exit(void)
 		proc_remove_node(i);
 		dev = dev_list[i];
 		spin_lock(&dev->lock);
-		if (dev->users > 0) {
-			printk(KERN_DEBUG "ntfspunch: %s still in use %d\n",
-			       dev->filename, dev->users);
-		}
-		if (dev->img_fp) {
-			filp_close(dev->img_fp, 0);
-		}
-		if (dev->gd) {
-			del_gendisk(dev->gd);
-			put_disk(dev->gd);
-		}
-		if (dev->queue) {
-			blk_cleanup_queue(dev->queue);
-		}
-		kfree(dev->rl);
-		kfree(dev);
+		ntfspunch_free_dev(dev);
 	}
 	if (dev_list != NULL) {
 		kfree(dev_list);
